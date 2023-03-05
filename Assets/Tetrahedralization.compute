@@ -1,0 +1,203 @@
+#pragma kernel ClearVoxelsKernel          // clear voxel array 
+#pragma kernel BuildVoxelsKernel          // add Voronoi seeds into voxel array
+#pragma kernel JumpFloodingKernel         // execute 3D Jump Flooding Algorithm (input = voxel array, output = volume texture with 3D Voronoi Diagram)
+#pragma kernel PolyhedronizationKernel    // generate points from 3D Voronoi Diagram (vertices and edges of Voronoi polyhedra)
+#pragma kernel TetrahedralizationKernel   // generate Delaunay tetrahedrons from 3D Voronoi Diagram
+#pragma warning(disable: 4714)
+
+struct Seed
+{
+	float3 Location;
+	float3 Color;
+};
+
+struct Triangle
+{
+	float3 A;
+	float3 B;
+	float3 C;
+};
+
+uint _Animation, _VoronoiEdges, _Frame, _Resolution;
+float _MaxSteps, _Time, _Scale;
+RWStructuredBuffer<Seed> _Seeds;
+RWStructuredBuffer<float4> _Voxels;
+AppendStructuredBuffer<float3> _Vertices;
+AppendStructuredBuffer<Triangle> _Triangles;
+Texture3D<float4> _Texture3D;
+RWTexture3D<float4> _RWTexture3D;
+
+float3 Remap (float3 p, float a, float b, float c, float d)
+{
+	float x = (p.x - a) / (b - a) * (d - c) + c;
+	float y = (p.y - a) / (b - a) * (d - c) + c;
+	float z = (p.z - a) / (b - a) * (d - c) + c;
+	return float3(x, y, z); 
+}
+
+Triangle CreateTriangle (float3 a, float3 b, float3 c)
+{
+	Triangle polygon = (Triangle) 0;
+	polygon.A = a;
+	polygon.B = b;
+	polygon.C = c;
+	return polygon;
+}
+
+float4 JFA3D (float3 fragCoord, float level)
+{
+	float range = clamp(level - 1.0, 0.0, _MaxSteps);
+	float stepwidth = floor(exp2(_MaxSteps - range) + 0.5);
+	float bestDistance = 9999.0;
+	float3 bestCoord = float3(0.0, 0.0, 0.0);
+	float bestIndex = 0.0;
+	for (int z = -1; z <= 1; ++z)
+	{
+		for (int y = -1; y <= 1; ++y) 
+		{
+			for (int x = -1; x <= 1; ++x) 
+			{
+				float3 neighbour = fragCoord + float3(x,y,z) * stepwidth;
+				float4 source = _Texture3D.Load(int4(neighbour, 0));
+				float3 seedCoord = source.xyz;
+				float seedIndex = source.w;
+				float magnitude = length(seedCoord - fragCoord);
+				if ((seedCoord.x != 0.0 || seedCoord.y != 0.0 || seedCoord.z != 0.0) && magnitude < bestDistance)
+				{
+					bestDistance = magnitude;
+					bestCoord = seedCoord;
+					bestIndex = seedIndex;
+				}
+			}
+		}
+	}
+	return float4(bestCoord, bestIndex);
+}
+
+[numthreads(8,8,8)]
+void ClearVoxelsKernel (uint3 id : SV_DispatchThreadID)
+{
+	uint instance = id.x * _Resolution * _Resolution + id.y * _Resolution + id.z;
+	_Voxels[instance] = float4(-1.0, -1.0, -1.0, -1.0);
+}
+
+[numthreads(8,1,1)]
+void BuildVoxelsKernel (uint3 id : SV_DispatchThreadID)
+{
+	float factor = pow(_Resolution / 128.0, 5.0);
+	float angle = _Time + id.x;
+	_Seeds[id.x].Location += _Animation * float3(sin(angle), cos(angle), cos(1.0 - angle)) * factor;
+	_Seeds[id.x].Location = clamp(_Seeds[id.x].Location, (float3)0.0, (float3)(_Resolution - 1));
+	int3 location = int3(_Seeds[id.x].Location);
+	int instance = location.x * _Resolution * _Resolution + location.y * _Resolution + location.z;
+	_Voxels[instance] = float4(_Seeds[id.x].Color, floor(id.x));
+}
+
+[numthreads(8,8,8)]
+void JumpFloodingKernel (uint3 id : SV_DispatchThreadID)
+{
+	float3 fragCoord = float3(id.x, id.y, id.z);
+	if (_Frame == 0u) 
+	{
+		uint instance = id.x * _Resolution * _Resolution + id.y * _Resolution + id.z;
+		float4 buffer = _Voxels[instance];
+		_RWTexture3D[id] = (buffer.x < 0.0) ? float4(0,0,0,1) : float4(fragCoord, buffer.w);
+		return;
+	}
+	_RWTexture3D[id] = JFA3D(fragCoord, floor(float(_Frame)));
+}
+
+[numthreads(8,8,8)]
+void PolyhedronizationKernel (uint3 id : SV_DispatchThreadID)
+{
+	float3 fragCoord = float3(id.x, id.y, id.z);
+	float4 source = _Texture3D.Load(int4(fragCoord, 0));
+	float3 neighbours[27];
+	int count = 1;
+	int index = 0;
+	float2 border = float2(0.0, _Resolution - 1u);
+	for (int z = -1; z <= 1; z++)
+	{
+		for (int y = -1; y <= 1; y++)
+		{
+			for (int x = -1; x <= 1; x++) 
+			{
+				float3 coords = fragCoord + float3(x, y, z);
+				count += (all(coords < border.xxx || coords > border.yyy)) ? 1 : 0;
+				neighbours[index] = _Texture3D.Load(int4(coords, 0)).rgb;
+				index++;
+			}
+		}
+	}
+	for (int i = 1; i < 27; i++) // count distinct voxels in an array
+	{
+		int j = 0;
+		for (j = 0; j < i; j++)
+		{
+			if (all(abs(neighbours[i] - neighbours[j]) < 0.001))
+				break;
+		}
+		count += (i == j) ? 1 : 0;
+	}
+	int threshold = (_VoronoiEdges == 1) ? 3 : 4;
+	if (count >= threshold) // if we found a contact point between at least three Voronoi cells, we can generate new vertex
+	{
+		float3 uvw = fragCoord / _Resolution.xxx;
+		float3 offset = float3(0.5, 0.5, 0.5);
+		float3 position = (uvw - offset) * 1.015 * _Scale;
+		_Vertices.Append (position);
+	}
+}
+
+[numthreads(8,8,8)]
+void TetrahedralizationKernel (uint3 id : SV_DispatchThreadID)
+{
+	float3 fragCoord = float3(id.x, id.y, id.z);
+	float4 source = _Texture3D.Load(int4(fragCoord, 0));
+	float4 neighbours[26];
+	int cells[4] = {int(floor(source.a)), 0, 0, 0};
+	int count = 1;
+	int index = 0;
+	float2 border = float2(0.0, _Resolution - 1u);
+	for (int z = -1; z <= 1; z++) // get all neighbour voxels
+	{
+		for (int y = -1; y <= 1; y++) 
+		{
+			for (int x = -1; x <= 1; x++) 
+			{
+				int3 offset = int3(x, y, z);
+				if (all(offset == int3(0, 0, 0))) continue;
+				float3 coords = fragCoord + float3(offset);
+				bool off = any(coords < border.xxx) || any(coords > border.yyy);
+				neighbours[index] = off ? source : _Texture3D.Load(int4(coords, 0));
+				index++;
+			}
+		}
+	}
+	for (int i = 0; i < 26; i++) // count distinct voxels in an array
+	{
+		int j = 0;
+		for (j = 0; j <= i; j++)
+		{
+			if (all(abs(neighbours[i].rgb - neighbours[j].rgb) < 0.001))
+				break;
+		}
+		if (i == j)
+		{
+			cells[count] = int(floor(neighbours[i].a));
+			count += 1; 
+		}
+	}
+	if (count == 4) // if we found a contact point between four Voronoi cells, we can generate new tetrahedron
+	{
+		float range = _Scale * 0.5;
+		float3 a = Remap(_Seeds[cells[0]].Location, 0, float(_Resolution), -range, range);
+		float3 b = Remap(_Seeds[cells[1]].Location, 0, float(_Resolution), -range, range);
+		float3 c = Remap(_Seeds[cells[2]].Location, 0, float(_Resolution), -range, range);
+		float3 d = Remap(_Seeds[cells[3]].Location, 0, float(_Resolution), -range, range);
+		_Triangles.Append(CreateTriangle (a, b, c));
+		_Triangles.Append(CreateTriangle (b, c, d));
+		_Triangles.Append(CreateTriangle (a, c, d));
+		_Triangles.Append(CreateTriangle (a, b, d));
+	}
+}
